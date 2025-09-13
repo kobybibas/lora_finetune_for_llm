@@ -1,9 +1,11 @@
+import time
 from datetime import datetime
 
 import lightning as L
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
+from lightning.pytorch.callbacks import DeviceStatsMonitor
 from lightning.pytorch.loggers import CSVLogger
 from torch import nn
 from torch.optim import AdamW
@@ -11,11 +13,14 @@ from torch.utils.data import DataLoader
 from torchmetrics import Accuracy
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-DEBUG = True
+DEBUG = False
 MAX_EPOCHS = 20
 MILESTONE = [10, 15]
 LR = 1e-3
 NUM_DATALOADER_WORKERS = 9
+
+FINE_TUNE_TYPE = "lora"
+assert FINE_TUNE_TYPE in ("lora", "last_layer", "entire_model")
 
 
 class LoRALayer(nn.Module):
@@ -60,7 +65,41 @@ class LoRALinear(nn.Module):
         return original_out + lora_out
 
 
-class LoRAFinetuneModule(L.LightningModule):
+def apply_lora_to_bert(model, rank=8, alpha=16, target_layers=None):
+    """Apply LoRA to specific BERT attention layers"""
+    if target_layers is None:
+        target_layers = ["query", "value"]  # Q+V as discussed
+
+    # Apply to all transformer layers
+    for layer_idx in range(len(model.bert.encoder.layer)):
+        layer = model.bert.encoder.layer[layer_idx]
+
+        if "query" in target_layers:
+            original_query = layer.attention.self.query
+            layer.attention.self.query = LoRALinear(
+                original_query, rank=rank, alpha=alpha
+            )
+
+        if "value" in target_layers:
+            original_value = layer.attention.self.value
+            layer.attention.self.value = LoRALinear(
+                original_value, rank=rank, alpha=alpha
+            )
+
+        if "key" in target_layers:
+            original_key = layer.attention.self.key
+            layer.attention.self.key = LoRALinear(original_key, rank=rank, alpha=alpha)
+
+        if "output" in target_layers:
+            original_output = layer.attention.output.dense
+            layer.attention.output.dense = LoRALinear(
+                original_output, rank=rank, alpha=alpha
+            )
+
+    return model
+
+
+class LitFinetuneModule(L.LightningModule):
     def __init__(self, model, learning_rate=LR, milestones=MILESTONE, warmup_steps=500):
         super().__init__()
 
@@ -68,7 +107,7 @@ class LoRAFinetuneModule(L.LightningModule):
         self.learning_rate = learning_rate
         self.milestones = milestones
         self.warmup_steps = warmup_steps
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["model"])
 
         self.model = model
 
@@ -108,10 +147,15 @@ class LoRAFinetuneModule(L.LightningModule):
             train_acc_mean = torch.stack(self.training_step_accuracy_outputs).mean()
         val_loss_mean = torch.stack(self.validation_step_loss_outputs).mean()
         val_acc_mean = torch.stack(self.validation_step_accuracy_outputs).mean()
-        lr = self.trainer.optimizers[0].param_groups[0]["lr"]
+
+        lr = -1
+        if len(self.trainer.optimizers) > 0:
+            lr = self.trainer.optimizers[0].param_groups[0]["lr"]
+
         print(
             f"[Epoch {self.trainer.current_epoch}] Validation [Loss Acc]=[{val_loss_mean:.2f} {val_acc_mean:.2f}] Training [Loss Acc]=[{train_loss_mean:.2f} {train_acc_mean:.2f}] lr={lr:.2e}"
         )
+
         self.log("val_loss", val_loss_mean, on_step=False, on_epoch=True)
         self.log("val_accuracy", val_acc_mean, on_step=False, on_epoch=True)
         self.log("train_loss", train_loss_mean, on_step=False, on_epoch=True)
@@ -121,7 +165,9 @@ class LoRAFinetuneModule(L.LightningModule):
         self.validation_step_loss_outputs.clear()
 
     def configure_optimizers(self):
+        all_params = [p for p in self.model.parameters()]
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        print(f"Parameters: {len(all_params)=} {len(trainable_params)=}")
         optimizer = AdamW(trainable_params, lr=self.learning_rate, weight_decay=0.01)
 
         scheduler = None
@@ -139,15 +185,22 @@ def main():
     now = datetime.now().strftime("%Y%m%d_%H%M%S")
     logger = CSVLogger("logs", name=now)
 
-    print("Loading base model")
+    print("-- Loading base model")
     model_name = "bert-base-uncased"
     model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
+    for param in model.parameters():
+        param.requires_grad = False
+    model.classifier.weight.requires_grad = True
+    model.classifier.bias.requires_grad = True
+
     print(model)
-    lit_model = LoRAFinetuneModule(model=model)
+    print("apply_lora_to_bert")
+    model = apply_lora_to_bert(model)
+    print(model)
+    lit_model = LitFinetuneModule(model=model)
 
-    print("Loading dataset")
+    print("-- Loading dataset")
     dataset = load_dataset("imdb")
-
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     def tokenize_function(examples):
@@ -158,37 +211,49 @@ def main():
     tokenized_datasets = tokenized_datasets.rename_column("label", "labels")
     tokenized_datasets.set_format("torch")
 
-    small_train_dataset = tokenized_datasets["train"].shuffle().select(range(5000))
-    small_eval_dataset = tokenized_datasets["test"].shuffle().select(range(5000))
+    train_dataset = tokenized_datasets["train"].shuffle().select(range(5000))
+    val_dataset = tokenized_datasets["test"].shuffle().select(range(5000))
 
     train_dataloader = DataLoader(
-        small_train_dataset,
+        train_dataset,
         shuffle=True,
         batch_size=8,
         num_workers=NUM_DATALOADER_WORKERS,
+        persistent_workers=True,
     )
-    eval_dataloader = DataLoader(
-        small_eval_dataset, batch_size=8, num_workers=NUM_DATALOADER_WORKERS
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=8,
+        num_workers=NUM_DATALOADER_WORKERS,
+        persistent_workers=True,
     )
 
-    # TODO: apply LORA module 
-
-    print("Training start")
     device = "mps" if torch.backends.mps.is_available() else "cpu"
     trainer = L.Trainer(
         max_epochs=1 if DEBUG else MAX_EPOCHS,
         accelerator=device,
         logger=logger,
+        callbacks=[DeviceStatsMonitor()],
         limit_train_batches=100 if DEBUG else None,
         limit_val_batches=10 if DEBUG else None,
         limit_test_batches=10 if DEBUG else None,
+        num_sanity_val_steps=0,
     )
+    print("-- Training start")
+    start_time = time.time()
     trainer.fit(
         model=lit_model,
         train_dataloaders=train_dataloader,
-        val_dataloaders=eval_dataloader,
+        val_dataloaders=val_dataloader,
     )
-    print("Training finish")
+    print(f"-- Training finish in {time.time() - start_time:.2f}")
+
+    # TODO: Add plots
+    # 1.accuracy over epochs for val and train
+    # 2. loss over epochs for val and train
+    # 3. LR over epochs
+    # 4. mps ultization over epochs
+    # Compare finetune all model vs, only last layer, vs LORA
 
 
 if __name__ == "__main__":
