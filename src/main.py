@@ -13,14 +13,15 @@ from torch.utils.data import DataLoader
 from torchmetrics import Accuracy
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-DEBUG = False
-MAX_EPOCHS = 3
-MILESTONE = [10, 15]
+DEBUG = True
+MAX_EPOCHS = 5
+MILESTONE = [4]
 LR = 1e-3
+BATCH_SIZE = 16
 NUM_DATALOADER_WORKERS = 9
 
-FINE_TUNE_TYPE = "lora"
-assert FINE_TUNE_TYPE in ("lora", "last_layer", "entire_model")
+FINE_TUNE_TYPE = "lora"  # "lora", "entire_model"
+assert FINE_TUNE_TYPE in ("lora", "entire_model")
 
 
 class LoRALayer(nn.Module):
@@ -119,6 +120,16 @@ class LitFinetuneModule(L.LightningModule):
         self.training_step_accuracy_outputs = []
         self.validation_step_accuracy_outputs = []
 
+    def print_mps_memory(self):
+        allocated = torch.mps.current_allocated_memory() / 1024**3  # GB
+        total = torch.mps.driver_allocated_memory() / 1024**3  # GB
+        max_mem = torch.mps.recommended_max_memory() / 1024**3  # GB
+
+        print(
+            f"MPS Memory - Allocated: {allocated:.2f}GB, Total: {total:.2f}GB, Max: {max_mem:.2f}GB"
+        )
+        print(f"Utilization: {(allocated / total) * 100:.1f}%")
+
     def _step(self, batch):
         # batch['labels'], batch['input_ids'], batch['token_type_ids'], batch['attention_mask']
         output = self.model(**batch)
@@ -132,6 +143,10 @@ class LitFinetuneModule(L.LightningModule):
         loss, accuracy_value = self._step(batch)
         self.training_step_loss_outputs.append(loss)
         self.training_step_accuracy_outputs.append(accuracy_value)
+
+        if (batch_idx % 100) == 5:
+            self.print_mps_memory()
+            torch.mps.empty_cache()  # Clear unused cache
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -152,10 +167,6 @@ class LitFinetuneModule(L.LightningModule):
         if len(self.trainer.optimizers) > 0:
             lr = self.trainer.optimizers[0].param_groups[0]["lr"]
 
-        print(
-            f"[Epoch {self.trainer.current_epoch}] Validation [Loss Acc]=[{val_loss_mean:.2f} {val_acc_mean:.2f}] Training [Loss Acc]=[{train_loss_mean:.2f} {train_acc_mean:.2f}] lr={lr:.2e}"
-        )
-
         self.log("val_loss", val_loss_mean, on_step=False, on_epoch=True)
         self.log("val_accuracy", val_acc_mean, on_step=False, on_epoch=True)
         self.log("train_loss", train_loss_mean, on_step=False, on_epoch=True)
@@ -165,9 +176,7 @@ class LitFinetuneModule(L.LightningModule):
         self.validation_step_loss_outputs.clear()
 
     def configure_optimizers(self):
-        all_params = [p for p in self.model.parameters()]
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]
-        print(f"Parameters: {len(all_params)=} {len(trainable_params)=}")
         optimizer = AdamW(trainable_params, lr=self.learning_rate, weight_decay=0.01)
 
         scheduler = None
@@ -179,24 +188,33 @@ class LitFinetuneModule(L.LightningModule):
 
 
 def main():
-    import os
-
-    print(os.getcwd())
-    now = datetime.now().strftime("%Y%m%d_%H%M%S")
-    logger = CSVLogger("logs", name=now)
+    logger = CSVLogger(
+        "logs", name=datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + FINE_TUNE_TYPE
+    )
 
     print("-- Loading base model")
     model_name = "bert-base-uncased"
     model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
-    for param in model.parameters():
-        param.requires_grad = False
-    model.classifier.weight.requires_grad = True
-    model.classifier.bias.requires_grad = True
 
-    print(model)
-    print("apply_lora_to_bert")
-    model = apply_lora_to_bert(model)
-    print(model)
+    if FINE_TUNE_TYPE == "lora":
+        # Freeze all parameters except classifier and LoRA layers
+        for param in model.parameters():
+            param.requires_grad = False
+        model.classifier.weight.requires_grad = True
+        model.classifier.bias.requires_grad = True
+        print(model)
+        print("apply_lora_to_bert")
+        model = apply_lora_to_bert(model)
+        print(model)
+    elif FINE_TUNE_TYPE == "entire_model":
+        # Unfreeze all parameters for full fine-tuning
+        for param in model.parameters():
+            param.requires_grad = True
+        print("Training entire model (no LoRA)")
+        print(model)
+    else:
+        raise ValueError(f"Unknown FINE_TUNE_TYPE: {FINE_TUNE_TYPE}")
+
     lit_model = LitFinetuneModule(model=model)
 
     print("-- Loading dataset")
@@ -217,13 +235,13 @@ def main():
     train_dataloader = DataLoader(
         train_dataset,
         shuffle=True,
-        batch_size=8,
+        batch_size=BATCH_SIZE,
         num_workers=NUM_DATALOADER_WORKERS,
         persistent_workers=True,
     )
     val_dataloader = DataLoader(
         val_dataset,
-        batch_size=8,
+        batch_size=BATCH_SIZE,
         num_workers=NUM_DATALOADER_WORKERS,
         persistent_workers=True,
     )
@@ -234,7 +252,7 @@ def main():
         accelerator=device,
         logger=logger,
         callbacks=[DeviceStatsMonitor()],
-        limit_train_batches=100 if DEBUG else None,
+        limit_train_batches=10 if DEBUG else None,
         limit_val_batches=10 if DEBUG else None,
         limit_test_batches=10 if DEBUG else None,
         num_sanity_val_steps=0,
@@ -247,13 +265,6 @@ def main():
         val_dataloaders=val_dataloader,
     )
     print(f"-- Training finish in {time.time() - start_time:.2f}")
-
-    # TODO: Add plots
-    # 1.accuracy over epochs for val and train
-    # 2. loss over epochs for val and train
-    # 3. LR over epochs
-    # 4. mps ultization over epochs
-    # Compare finetune all model vs, only last layer, vs LORA
 
 
 if __name__ == "__main__":

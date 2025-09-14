@@ -37,10 +37,10 @@ def apply_lora_to_bert(model, rank=8, alpha=16):
 Query and Value projections is usually used in LoRA although the Key and Fully Connected layer can be transformed as well.
 
 # Baseline vs LoRA Performance** (IMDB sentiment classification):
-| Metric | Entire Model | LoRA Fine-tuned | Improvement |
+| Metric | Entire Model | LoRA Fine-tuned |
 | :-- | :-- | :-- | :-- |
 | Accuracy | TBD | TBD | TBD% |
-| Parameters | TBD | TBD trainable | TBD% reduction |
+| Parameters | 109M | 0.3M trainable | 
 
 
 Lora (best epoch)
