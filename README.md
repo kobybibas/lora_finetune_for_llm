@@ -39,9 +39,12 @@ Query and Value projections is usually used in LoRA although the Key and Fully C
 # Baseline vs LoRA Performance** (IMDB sentiment classification):
 | Metric | Entire Model | LoRA Fine-tuned |
 | :-- | :-- | :-- | :-- |
-| Accuracy | TBD | TBD | TBD% |
+| Accuracy | 0.5 | 0.89 | 
 | Parameters | 109M | 0.3M trainable | 
 
+LORA:
+Epoch 4] Validation [Loss Acc]=[0.34 0.89] Training [Loss Acc]=[0.06 0.92] lr=1.00e-04
+Epoch 4] Validation [Loss Acc]=[0.70 0.50] Training [Loss Acc]=[0.70 0.50] 
 
 Lora (best epoch)
 [Epoch 3] Validation [Loss Acc]=[0.69 0.68] Training [Loss Acc]=[0.71 0.74] lr=1.00e-0

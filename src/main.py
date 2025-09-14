@@ -3,7 +3,6 @@ from datetime import datetime
 
 import lightning as L
 import torch
-import torch.nn.functional as F
 from datasets import load_dataset
 from lightning.pytorch.callbacks import DeviceStatsMonitor
 from lightning.pytorch.loggers import CSVLogger
@@ -13,7 +12,8 @@ from torch.utils.data import DataLoader
 from torchmetrics import Accuracy
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-DEBUG = True
+DEBUG = False
+
 MAX_EPOCHS = 5
 MILESTONE = [4]
 LR = 1e-3
@@ -126,9 +126,8 @@ class LitFinetuneModule(L.LightningModule):
         max_mem = torch.mps.recommended_max_memory() / 1024**3  # GB
 
         print(
-            f"MPS Memory - Allocated: {allocated:.2f}GB, Total: {total:.2f}GB, Max: {max_mem:.2f}GB"
+            f"MPS Memory - Allocated: {allocated:.2f}GB, Total: {total:.2f}GB, Max: {max_mem:.2f}GB. Utilization: {(allocated / total) * 100:.1f}%"
         )
-        print(f"Utilization: {(allocated / total) * 100:.1f}%")
 
     def _step(self, batch):
         # batch['labels'], batch['input_ids'], batch['token_type_ids'], batch['attention_mask']
@@ -144,7 +143,7 @@ class LitFinetuneModule(L.LightningModule):
         self.training_step_loss_outputs.append(loss)
         self.training_step_accuracy_outputs.append(accuracy_value)
 
-        if (batch_idx % 100) == 5:
+        if (batch_idx % 350) == 5:
             self.print_mps_memory()
             torch.mps.empty_cache()  # Clear unused cache
         return loss
@@ -166,6 +165,10 @@ class LitFinetuneModule(L.LightningModule):
         lr = -1
         if len(self.trainer.optimizers) > 0:
             lr = self.trainer.optimizers[0].param_groups[0]["lr"]
+
+        print(
+            f"[Epoch {self.trainer.current_epoch}] Validation [Loss Acc]=[{val_loss_mean:.2f} {val_acc_mean:.2f}] Training [Loss Acc]=[{train_loss_mean:.2f} {train_acc_mean:.2f}] lr={lr:.2e}"
+        )
 
         self.log("val_loss", val_loss_mean, on_step=False, on_epoch=True)
         self.log("val_accuracy", val_acc_mean, on_step=False, on_epoch=True)
