@@ -14,7 +14,7 @@ from torchmetrics import Accuracy
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 DEBUG = False
-MAX_EPOCHS = 20
+MAX_EPOCHS = 3
 MILESTONE = [10, 15]
 LR = 1e-3
 NUM_DATALOADER_WORKERS = 9
